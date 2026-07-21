@@ -1,0 +1,6 @@
+services:
+  monitor:
+    build: .
+    pid: "host"
+    tty: true
+    stdin_open: true
