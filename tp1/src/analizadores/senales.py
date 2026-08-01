@@ -1,11 +1,14 @@
-import signal
 import time
 
 import procfs
+# ojo: este módulo es "analizadores.senales" (la VISTA de señales de los
+# procesos monitoreados); "senales" a secas es src/senales.py, el manejo de
+# señales del propio monitor. Son cosas distintas con nombre parecido.
+from senales import ignorar_senales_en_hijo
 
 
 def correr_senales(snapshot, pids_compartidos, intervalo):
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    ignorar_senales_en_hijo()
 
     while True:
         ahora = time.time()

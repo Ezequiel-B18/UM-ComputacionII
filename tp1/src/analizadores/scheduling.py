@@ -1,14 +1,14 @@
-import signal
 import time
 
 import procfs
+from senales import ignorar_senales_en_hijo
 
 # valores de sched_setscheduler(2) -- no hay enum estándar en la stdlib para esto
 NOMBRES_POLICY = {0: "OTHER", 1: "FIFO", 2: "RR", 3: "BATCH", 5: "IDLE"}
 
 
 def correr_scheduling(snapshot, pids_compartidos, intervalo):
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    ignorar_senales_en_hijo()
 
     while True:
         ahora = time.time()

@@ -7,8 +7,8 @@ Ezequiel Blajevitch
 ## Estado actual
 
 En construcción. Completo: Docker/estructura del repo, `procfs.py` (parseo de
-`/proc`), recolector + 7 analizadores multiproceso con snapshot compartido.
-Falta: TUI (Fase 4) y manejo completo de señales más allá de SIGINT (Fase 5).
+`/proc`), recolector + 7 analizadores multiproceso con snapshot compartido,
+manejo completo de las 5 señales (self-pipe). Falta: TUI (Fase 4).
 
 ## Descripción general
 
@@ -108,9 +108,34 @@ Fix: cada función de analizador llama
 `signal.signal(signal.SIGINT, signal.SIG_IGN)` como primera línea, ignorando
 la señal explícitamente. Así, sin importar cómo se propague la señal, **solo
 el proceso principal reacciona** y decide el shutdown, cerrando a los hijos
-ordenadamente con `terminate()` + `join()`. Esta es la versión mínima —
-la Fase 5 va a reemplazar el handler del padre por un patrón self-pipe
-completo, y sumar el resto de las señales (SIGHUP, SIGUSR1, SIGUSR2).
+ordenadamente con `terminate()` + `join()`.
+
+### Señales completas: patrón self-pipe (`senales.py`)
+
+Un signal handler real corre en un contexto muy restringido: casi ninguna
+función de Python (ni siquiera `print()` o tocar un dict) es segura de
+llamar ahí. La solución (self-pipe, Clase 6): el handler hace **una sola
+cosa async-signal-safe**, escribir un byte a un pipe (`os.write`). El loop
+principal, afuera del contexto de señal, espera con `select()` sobre ese
+pipe y recién ahí hace el trabajo real: decidir shutdown (SIGINT/SIGTERM),
+recargar `config.json` (SIGHUP), volcar el snapshot a
+`dump_<timestamp>.json` (SIGUSR1), o togglear modo verbose (SIGUSR2).
+
+`ManejadorSenales` (proceso principal) instala un handler para las 5
+señales. `ignorar_senales_en_hijo()` (recolector + 7 analizadores) ignora
+SIGINT/SIGHUP/SIGUSR1/SIGUSR2 — esas señales solo tienen sentido para quien
+orquesta, no para cada hijo individualmente.
+
+**Segundo bug real, más sutil, encontrado al testear**: al principio hice
+que los hijos ignoraran **también** SIGTERM, con el mismo argumento ("solo
+el padre decide"). Pero `Process.terminate()` de `multiprocessing`
+funciona mandándole SIGTERM **directo y puntual** a ese proceso — no es una
+señal de "grupo" como SIGINT. Al ignorarla en el hijo, `terminate()` dejaba
+de tener efecto: el hijo quedaba vivo para siempre después del "shutdown".
+Lo verifiqué con `ps --ppid` después de mandar SIGINT al proceso principal:
+los hijos seguían listados como vivos. Fix: SIGTERM se saca de la lista de
+señales que el hijo ignora, dejando la acción default (terminar), que es
+exactamente lo que `terminate()` necesita para funcionar.
 
 ### Por qué estos intervalos por defecto
 
@@ -146,13 +171,14 @@ frecuencia que el estado de CPU o memoria de un proceso.
 ## Limitaciones conocidas
 
 - Todavía no hay TUI: `main.py` imprime el snapshot por consola en vez de
-  renderizar las 7 vistas interactivas.
-- El manejo de señales actual es solo SIGINT, con un handler simple (no
-  async-signal-safe con patrón self-pipe todavía) que ignora la señal en los
-  hijos y la maneja en el padre. Faltan SIGTERM/SIGHUP/SIGUSR1/SIGUSR2.
+  renderizar las 7 vistas interactivas. SIGWINCH (repintar en resize) queda
+  pendiente para cuando exista una pantalla real que repintar.
 - Procesos de otros usuarios (o del propio contenedor sin privilegios)
   generan `PermissionError` al leer su `/status`/`/maps`/`/fd` — se
   descartan silenciosamente en vez de mostrarse con datos parciales.
+- El modo verbose (SIGUSR2) hoy solo agrega más campos a la impresión por
+  consola de la vista "sistema"; falta definirlo para el resto de las vistas
+  cuando exista la TUI.
 
 ## Cómo correr y testear
 
@@ -165,3 +191,16 @@ Por ahora imprime cada 2 segundos un resumen del snapshot (CPU/memoria/carga
 del sistema y qué vistas ya tienen datos) y corre indefinidamente hasta
 `Ctrl+C`, que dispara un shutdown ordenado de los 8 procesos (recolector +
 7 analizadores). Todavía no hay TUI interactiva.
+
+### Probar las señales
+
+Con el contenedor corriendo (en otra terminal, `docker compose up -d`):
+
+```bash
+CID=$(docker compose ps -q monitor)
+docker kill --signal=HUP  $CID   # recarga config.json
+docker kill --signal=USR1 $CID   # dump_<timestamp>.json
+docker kill --signal=USR2 $CID   # toggle verbose
+docker kill --signal=INT  $CID   # shutdown limpio (o TERM, hacen lo mismo)
+docker compose logs monitor      # ver qué reaccionó a cada una
+```
