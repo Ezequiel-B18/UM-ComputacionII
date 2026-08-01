@@ -1,0 +1,15 @@
+{
+  "intervalos": {
+    "resumen": { "default": 2.0, "minimo": 0.5 },
+    "memoria": { "default": 3.0, "minimo": 1.0 },
+    "fds": { "default": 5.0, "minimo": 2.0 },
+    "threads": { "default": 2.0, "minimo": 0.5 },
+    "senales": { "default": 10.0, "minimo": 5.0 },
+    "scheduling": { "default": 10.0, "minimo": 5.0 },
+    "sistema": { "default": 2.0, "minimo": 1.0 }
+  },
+  "filtro_default": {
+    "comando": null,
+    "usuario": null
+  }
+}
