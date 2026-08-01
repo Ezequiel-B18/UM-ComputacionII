@@ -1,11 +1,11 @@
-import signal
 import time
 
 import procfs
+from senales import ignorar_senales_en_hijo
 
 
 def correr_sistema(snapshot, pids_compartidos, intervalo):
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    ignorar_senales_en_hijo()
 
     anterior_cpu = None  # (dict de jiffies globales, timestamp) para el delta de CPU%
 

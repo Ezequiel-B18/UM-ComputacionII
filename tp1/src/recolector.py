@@ -1,6 +1,7 @@
 import os
-import signal
 import time
+
+from senales import ignorar_senales_en_hijo
 
 
 def listar_pids():
@@ -8,9 +9,7 @@ def listar_pids():
 
 
 def correr_recolector(pids_compartidos, intervalo=1.0):
-    # solo el proceso principal decide el shutdown; este hijo ignora SIGINT
-    # para no correr su propio manejador si la señal llega a todo el grupo
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    ignorar_senales_en_hijo()  # solo el proceso principal decide qué hacer con cada señal
 
     while True:
         # asignación de slice (no "=") para mutar la Manager.list() in-place

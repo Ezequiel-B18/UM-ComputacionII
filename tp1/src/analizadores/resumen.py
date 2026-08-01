@@ -1,14 +1,14 @@
 import os
-import signal
 import time
 
 import procfs
+from senales import ignorar_senales_en_hijo
 
 HZ = os.sysconf("SC_CLK_TCK")  # jiffies por segundo -- NO es un 100 fijo en todas las máquinas
 
 
 def correr_resumen(snapshot, pids_compartidos, intervalo):
-    signal.signal(signal.SIGINT, signal.SIG_IGN)  # el padre maneja el shutdown, no este hijo
+    ignorar_senales_en_hijo()
 
     anteriores = {}  # pid -> (utime+stime, timestamp de esa lectura)
     # este dict vive en la memoria PRIVADA de este proceso: ningún otro
