@@ -6,9 +6,11 @@ Ezequiel Blajevitch
 
 ## Estado actual
 
-En construcción. Completo: Docker/estructura del repo, `procfs.py` (parseo de
-`/proc`), recolector + 7 analizadores multiproceso con snapshot compartido,
-manejo completo de las 5 señales (self-pipe). Falta: TUI (Fase 4).
+Funcionalidad obligatoria completa: Docker/estructura del repo, `procfs.py`
+(parseo de `/proc`), recolector + 7 analizadores multiproceso con snapshot
+compartido, manejo completo de las 5 señales (self-pipe), TUI con las 7
+vistas alternables. Pendiente: pulido general, capturas de pantalla, y
+extensiones opcionales (bonus).
 
 ## Descripción general
 
@@ -17,8 +19,9 @@ la anatomía interna de cada proceso (memoria, FDs, threads, señales,
 scheduling), leyendo `/proc` directamente. Arquitectura multiproceso: un
 recolector lista los PIDs vivos, 7 analizadores independientes extraen cada
 uno una dimensión distinta en paralelo, y todos escriben a un snapshot
-compartido en memoria (`Manager().dict()`). Por ahora, sin TUI, `main.py`
-imprime un resumen del snapshot por consola cada 2 segundos.
+compartido en memoria (`Manager().dict()`). Una TUI hecha con `curses`
+muestra una lista de procesos (arriba) y un panel de detalle que cambia según
+la vista activa (abajo), con navegación, filtros, pin y ordenamiento.
 
 ## Diagrama de arquitectura
 
@@ -45,6 +48,25 @@ imprime un resumen del snapshot por consola cada 2 segundos.
 Cada analizador es un `Process` independiente (no un thread) con su propio
 intervalo, guardado en un `multiprocessing.Value` para poder ajustarlo en
 runtime (pensado para cuando la TUI implemente `+`/`-`).
+
+## Capturas de pantalla
+
+**Vista Resumen** — lista de procesos con CPU%/RSS reales del sistema:
+
+![Vista resumen](docs/capturas/resumen.png)
+
+**Vista Memoria** — segmentos, faults y VmRSS/VmSize del proceso pineado:
+
+![Vista memoria](docs/capturas/memoria.png)
+
+**Vista Señales** — máscaras decodificadas (`SigBlk`, `SigIgn`, `SigCgt`...):
+
+![Vista señales](docs/capturas/senales.png)
+
+**Modo verbose** (`SIGUSR2`, o la tecla `v`) — vista Threads mostrando todas
+las entradas en vez de recortar a 12:
+
+![Modo verbose](docs/capturas/verbose.png)
 
 ## Decisiones de diseño
 
@@ -75,6 +97,22 @@ librería estándar para datos con forma arbitraria.
 Donde sí usamos `Value`: el intervalo de refresco de cada analizador es un
 solo `double` — ahí `Value("d", ...)` es exactamente el caso de uso correcto,
 y más liviano que meterlo en el `Manager`.
+
+### Por qué no usamos `Queue` ni `Pipe`
+
+Nuestra comunicación es de tipo **"muchos escritores, muchos lectores" sobre
+estado compartido** (cada analizador escribe su clave del snapshot; la TUI
+lee cualquier clave en cualquier momento) — no es un pipeline
+productor-consumidor de mensajes secuenciales, que es el caso de uso natural
+de `Queue`/`Pipe` (un mensaje se saca de la cola y desaparece para los demás
+lectores). Para nuestro problema, necesitábamos que el *último* valor de
+cada clave quedara disponible para quien lo pida, no una cola de eventos
+consumibles una sola vez — por eso `Manager().dict()` encaja mejor que
+`Queue`. La única cola de trabajo real que tenemos (`pids_compartidos`,
+el recolector "produce" la lista y los analizadores la "consumen") también
+se resolvió con `Manager().list()` en vez de `Queue`, porque cada analizador
+necesita **releer la lista completa en cada vuelta** (no consumir un ítem y
+que desaparezca) — todos necesitan ver los mismos PIDs al mismo tiempo.
 
 ### Cómo evitamos race conditions sin usar `Lock` explícito
 
@@ -137,6 +175,43 @@ los hijos seguían listados como vivos. Fix: SIGTERM se saca de la lista de
 señales que el hijo ignora, dejando la acción default (terminar), que es
 exactamente lo que `terminate()` necesita para funcionar.
 
+### TUI con `curses`, no `rich`
+
+Elegí `curses` (stdlib, cero dependencias) en vez de `rich` porque su modelo
+de `getch()` con timeout (`stdscr.nodelay(True)` + `stdscr.timeout(200)`)
+resuelve entrada de teclado y redibujado periódico **en un solo loop**, sin
+necesitar un thread aparte para leer stdin. `rich` es visualmente más prolijo
+pero para eso hay que armar el polling de teclado a mano con un thread —
+tiempo que no tenía de sobra.
+
+Ese mismo loop, en cada vuelta, primero revisa señales pendientes del
+self-pipe con `manejador.esperar(timeout=0)` (no bloqueante — la TUI no
+puede darse el lujo de esperar), después lee una tecla, y por último
+redibuja. Todo en el proceso principal, sin threads.
+
+`curses.wrapper()` envuelve `correr_tui` para garantizar que la terminal se
+restaure a su estado normal **incluso si el código de adentro tira una
+excepción** — importante, porque `curses` deja la terminal en modo raw y sin
+eco; sin este wrapper, un crash dejaría la terminal del usuario inutilizable
+hasta cerrar la sesión.
+
+**Diseño de estado**: `EstadoTUI` (en `display.py`) guarda vista activa,
+selección, pin, filtros y orden — separado a propósito de las funciones de
+render y de curses, así `lista_procesos()` (filtro + orden + pin) se puede
+testear con un snapshot falso sin necesitar una terminal real. Lo hice así
+porque probar código de `curses` de punta a punta requiere una tty de verdad
+(usé `script` para simularlo en un contenedor, pero no reemplaza una prueba
+interactiva real).
+
+**Bug encontrado en esta fase**: al matar el grupo de procesos entero de
+golpe en una prueba (`timeout` + `script`), el proceso servidor del
+`Manager` murió antes que nuestro propio self-pipe procesara el shutdown, y
+la siguiente lectura del snapshot (`snapshot.get(...)`) explotó con
+`ConnectionResetError` — traceback crudo, terminal en mal estado. Se
+soluciona envolviendo el cuerpo del loop en un `try/except` que trata
+`ConnectionResetError`/`BrokenPipeError`/`EOFError`/`OSError` como señal de
+"hay que cerrar", en vez de dejar que se propague.
+
 ### Por qué estos intervalos por defecto
 
 Los valores (`resumen`/`sistema`/`threads` cada 2s, `memoria` 3s, `fds` 5s,
@@ -167,18 +242,58 @@ frecuencia que el estado de CPU o memoria de un proceso.
   arquitectura del recolector + analizadores + snapshot está construida
   sobre estas tres primitivas, con el criterio de elección justificado
   arriba.
+- **Threads como LWPs en `/proc/<pid>/task`** (Clase 10): la vista Threads
+  lista cada entrada de `task/` como un LWP independiente con su propio
+  `stat` (estado, CPU%) y `status` (context switches), tal cual se ve en el
+  sistema real con `ps -eLf`.
 
 ## Limitaciones conocidas
 
-- Todavía no hay TUI: `main.py` imprime el snapshot por consola en vez de
-  renderizar las 7 vistas interactivas. SIGWINCH (repintar en resize) queda
-  pendiente para cuando exista una pantalla real que repintar.
+- **SIGWINCH** (repintar al redimensionar la terminal) no está implementado
+  — es opcional según la consigna. `curses` recorta el contenido si la
+  ventana es más chica que lo que se quiere dibujar, pero no reacciona a un
+  resize en vivo.
 - Procesos de otros usuarios (o del propio contenedor sin privilegios)
   generan `PermissionError` al leer su `/status`/`/maps`/`/fd` — se
   descartan silenciosamente en vez de mostrarse con datos parciales.
-- El modo verbose (SIGUSR2) hoy solo agrega más campos a la impresión por
-  consola de la vista "sistema"; falta definirlo para el resto de las vistas
-  cuando exista la TUI.
+- El modo verbose (SIGUSR2) hoy solo afecta las vistas de FDs y Threads
+  (muestra todas las entradas en vez de recortar a 12) — el ejemplo textual
+  de la consigna. El resto de las vistas ya muestran toda su info siempre,
+  así que no había nada que "destapar" con verbose.
+- Solo se puede pinear **un** proceso a la vez (`estado.pid_pineado` es un
+  solo valor, no una lista) — cumple lo que pide la consigna en singular.
+  Pinear varios a la vez se parece al bonus "comparativa cross-proceso"
+  (no implementado).
+- `docker compose up` (sin `-d`, un solo servicio) puede mostrar la salida
+  de `curses` mezclada con el prefijo de log de Compose (`monitor-1  |`) y
+  no reenviar el teclado de forma confiable — es una limitación del modo
+  "attached" de Compose para procesos de pantalla completa, no de nuestro
+  código. Para probar la TUI interactivamente, usar
+  `docker compose run --rm monitor` (ver más abajo).
+
+### Bugs encontrados en la prueba manual interactiva (y sus fixes)
+
+Probar con teclado real (no solo con `script` simulando una terminal) hizo
+aparecer dos bugs reales que las pruebas automatizadas no detectaban:
+
+1. **Pin/unpin roto tras navegar**: `estado.seleccion` era un índice de fila
+   sobre una lista que se reordena en vivo (CPU%/RSS cambian cada segundo).
+   Al pinear, el proceso saltaba a la fila 0 en el próximo frame, pero
+   `seleccion` quedaba con el valor viejo — un segundo `Enter` (pensado para
+   despinear) terminaba pineando OTRO proceso, el que casualmente quedó en
+   esa fila. Fix en `_togglear_pin()`: si ya hay algo pineado, `Enter`
+   **siempre** lo despinea, sin mirar `seleccion` para nada.
+2. **Selección invisible al bajar de la fila 10**: la lista dibujaba siempre
+   `procesos[:10]` fijo; bajar más allá de esa fila seguía incrementando
+   `estado.seleccion` pero esas filas nunca se llegaban a dibujar, así que
+   el highlight "desaparecía" sin ningún error. Fix: `filas_visibles()`
+   calcula una ventana de scroll que sigue a la selección (estilo
+   `less`/`htop`), y la altura de la lista ahora es dinámica según el alto
+   real de la terminal en vez de un `10` fijo.
+
+Con esto arreglado, validé a mano — flechas, `Enter` (pin/unpin con
+navegación de por medio), `/` y `u` (filtros), `c` (orden), `+`/`-`
+(intervalos), `h`/`?` (ayuda), `q` (salir) — sin encontrar nada más.
 
 ## Cómo correr y testear
 
@@ -187,10 +302,37 @@ cd tp1
 docker compose up --build
 ```
 
-Por ahora imprime cada 2 segundos un resumen del snapshot (CPU/memoria/carga
-del sistema y qué vistas ya tienen datos) y corre indefinidamente hasta
-`Ctrl+C`, que dispara un shutdown ordenado de los 8 procesos (recolector +
-7 analizadores). Todavía no hay TUI interactiva.
+Este es el comando pedido por la consigna: construye la imagen y levanta el
+contenedor. **Para usar la TUI de forma interactiva de verdad**, la manera
+confiable es:
+
+```bash
+docker compose run --rm monitor
+```
+
+`run` conecta la terminal directo al contenedor (stdin/stdout/tty reales),
+sin el wrapper de streaming de logs que usa `up` en foreground. Navegá con
+las teclas de la tabla de arriba (`1-7`/`r,m,f,t,s,p,g` para cambiar de
+vista, flechas para moverte por la lista, `h`/`?` para ayuda, `q` para
+salir). `q` o `Ctrl+C` disparan un shutdown ordenado de los 8 procesos
+(recolector + 7 analizadores).
+
+**Extra sobre modo verbose**: además de mandar `SIGUSR2` desde afuera
+(`docker kill --signal=USR2 <contenedor>`), la tecla `v` dentro de la TUI
+hace que el proceso se mande la señal a sí mismo
+(`os.kill(os.getpid(), signal.SIGUSR2)`) — pasa por el mismo self-pipe y el
+mismo handler real, es solo una comodidad para no necesitar una segunda
+terminal.
+
+**Nota honesta sobre `docker compose up --build`**: probamos a fondo (ver
+`dudas.md`) por qué este comando, sin `-d`, no permite interactuar bien con
+la TUI — Compose multiplexa la salida con un prefijo de log por línea
+(`monitor-1  |`) y no reenvía el teclado de forma confiable al contenedor.
+Esto es una limitación conocida de `docker compose up` en modo foreground
+para programas de pantalla completa como `curses`, no un bug de nuestra
+arquitectura — lo verificamos también con `docker attach` y con
+`COMPOSE_MENU=0`. `run` es la vía que usamos para validar toda la
+interacción de teclado.
 
 ### Probar las señales
 
@@ -204,3 +346,29 @@ docker kill --signal=USR2 $CID   # toggle verbose
 docker kill --signal=INT  $CID   # shutdown limpio (o TERM, hacen lo mismo)
 docker compose logs monitor      # ver qué reaccionó a cada una
 ```
+
+## Lo que aprendiste
+
+En sistemas operativos vimos htop, procesos e hilos y me alegra haber podido
+manejarlos y haber creado mi propio "htop". No sabía que acceder a toda la
+información de los procesos fuese tan simple, pensaba que era más difícil —
+está todo ahí en texto plano en `/proc`, sin necesitar privilegios
+especiales.
+
+Lo que más me costó entender de la parte teórica fue por qué cada proceso
+tiene su propia memoria aislada, y que por eso un `dict` normal de Python no
+sirve para compartir datos entre el recolector y los analizadores — hace
+falta algo como `Manager`, que en realidad es un proceso servidor aparte al
+que todos le mandan mensajes. También me costó entender las máscaras de
+señales (`SigBlk`, `SigIgn`), pero una vez que entendí que cada bit
+representa una señal distinta, tuvo sentido.
+
+En algunos casos lo que más me costó fue testear las cosas, pero con la IA
+como profe me ayudó a resolver cualquier duda y/o problema que tuve.
+
+Lo que más me sorprendió de todo este trabajo es que lo que realmente me
+costó fue intentar hacer que `docker compose up` hiciese andar el programa
+bien, y es más, no lo pude lograr — tuve que usar `docker compose run
+monitor` para que ande jaja.
+
+Esas son mis reflexiones sobre este trabajo, profe.

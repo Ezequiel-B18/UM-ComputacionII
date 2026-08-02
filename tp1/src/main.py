@@ -1,6 +1,6 @@
+import curses
 import json
 import multiprocessing as mp
-import signal
 import time
 
 from recolector import correr_recolector
@@ -12,6 +12,7 @@ from analizadores.senales import correr_senales
 from analizadores.scheduling import correr_scheduling
 from analizadores.sistema import correr_sistema
 from senales import ManejadorSenales
+from display import correr_tui
 
 ANALIZADORES = {
     "resumen": correr_resumen,
@@ -67,50 +68,21 @@ def main():
         p.start()
 
     # se instala DESPUÉS de p.start() a propósito: cada hijo ya se auto-ignora
-    # estas 5 señales apenas arranca (ignorar_senales_en_hijo), así que el
+    # estas señales apenas arranca (ignorar_senales_en_hijo), así que el
     # orden de instalación acá ya no importa como importó con el bug de SIGINT
     manejador = ManejadorSenales()
 
-    corriendo = True
-    while corriendo:
-        for signum in manejador.esperar(timeout=2.0):
-            if signum in (signal.SIGINT, signal.SIGTERM):
-                print(f"\n{signal.Signals(signum).name} recibido, cerrando limpiamente...")
-                corriendo = False
-
-            elif signum == signal.SIGHUP:
-                print("SIGHUP recibido: recargando config.json...")
-                config = cargar_config()
-                for nombre, valor in intervalos.items():
-                    valor.value = config["intervalos"][nombre]["default"]
-
-            elif signum == signal.SIGUSR1:
-                ruta = dump_snapshot(snapshot)
-                print(f"SIGUSR1 recibido: snapshot volcado en {ruta}")
-
-            elif signum == signal.SIGUSR2:
-                modo_verbose.value = 1 - modo_verbose.value
-                estado = "ON" if modo_verbose.value else "OFF"
-                print(f"SIGUSR2 recibido: modo verbose {estado}")
-
-        if not corriendo:
-            break
-
-        if "sistema" in snapshot:
-            datos = snapshot["sistema"]["datos"]
-            linea = (
-                f"--- sistema: cpu_user={datos['cpu_pct']['user']}% "
-                f"procesos={datos['procesos_totales']} zombies={datos['zombies']} "
-                f"threads={datos['threads_totales']} load={datos['loadavg']['load_1min']}"
-            )
-            if modo_verbose.value:
-                linea += f" | por_estado={datos['por_estado']} top_cpu={datos['top_cpu']}"
-            print(linea + " ---")
-
-    print("Cerrando procesos hijos...")
-    for p in procesos:
-        p.terminate()
-        p.join()
+    try:
+        # curses.wrapper se encarga de dejar la terminal en modo raw y,
+        # pase lo que pase adentro (excepción incluida), restaurarla al salir
+        curses.wrapper(
+            correr_tui, snapshot, pids_compartidos, intervalos, config, modo_verbose, manejador, dump_snapshot,
+            cargar_config,
+        )
+    finally:
+        for p in procesos:
+            p.terminate()
+            p.join()
 
 
 if __name__ == "__main__":
