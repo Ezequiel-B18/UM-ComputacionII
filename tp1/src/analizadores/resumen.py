@@ -43,6 +43,8 @@ def correr_resumen(snapshot, pids_compartidos, intervalo):
 
             resumen[pid] = {
                 "ppid": stat["ppid"],
+                "uid": status["uid_real"],
+                "gid": status["gid_real"],
                 "state": stat["state"],
                 "usuario": status["usuario"],
                 "cmd": cmdline or f"[{stat['comm']}]",
