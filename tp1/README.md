@@ -6,11 +6,10 @@ Ezequiel Blajevitch
 
 ## Estado actual
 
-Funcionalidad obligatoria completa: Docker/estructura del repo, `procfs.py`
-(parseo de `/proc`), recolector + 7 analizadores multiproceso con snapshot
-compartido, manejo completo de las 5 señales (self-pipe), TUI con las 7
-vistas alternables. Pendiente: pulido general, capturas de pantalla, y
-extensiones opcionales (bonus).
+Completo: Docker/estructura del repo, `procfs.py` (parseo de `/proc`),
+recolector + 7 analizadores multiproceso con snapshot compartido, manejo
+completo de las 5 señales (self-pipe), TUI con las 7 vistas alternables, y
+las 8 extensiones opcionales (bonus) de la consigna.
 
 ## Descripción general
 
@@ -314,8 +313,9 @@ docker compose run --rm monitor
 sin el wrapper de streaming de logs que usa `up` en foreground. Navegá con
 las teclas de la tabla de arriba (`1-7`/`r,m,f,t,s,p,g` para cambiar de
 vista, flechas para moverte por la lista, `h`/`?` para ayuda, `q` para
-salir). `q` o `Ctrl+C` disparan un shutdown ordenado de los 8 procesos
-(recolector + 7 analizadores).
+salir), más las de los bonus: `j` (jerarquía), `x`/`k` (marcar/comparar
+procesos), `v` (togglear verbose). `q` o `Ctrl+C` disparan un shutdown
+ordenado de los 9 procesos (recolector + exportador + 7 analizadores).
 
 **Extra sobre modo verbose**: además de mandar `SIGUSR2` desde afuera
 (`docker kill --signal=USR2 <contenedor>`), la tecla `v` dentro de la TUI
@@ -346,6 +346,32 @@ docker kill --signal=USR2 $CID   # toggle verbose
 docker kill --signal=INT  $CID   # shutdown limpio (o TERM, hacen lo mismo)
 docker compose logs monitor      # ver qué reaccionó a cada una
 ```
+
+### Correr los tests unitarios
+
+```bash
+python3 -m unittest tests.test_procfs -v
+```
+
+No necesitan Docker ni `/proc` real — usan archivos de muestra en `tests/fixtures/`
+y `unittest.mock` para aislar el parseo de `procfs.py` del sistema operativo.
+
+## Extensiones opcionales implementadas (bonus)
+
+Implementamos las 8 extensiones de la consigna. Todas probadas (unitariamente
+donde tiene sentido, y con teclado real vía `docker compose run` para las que
+tocan la TUI):
+
+| # | Extensión | Cómo probarla |
+|---|-----------|----------------|
+| 1 | **Histórico + mini-gráficos ASCII** | Vista Resumen (`1`/`r`): abajo del comando aparecen dos sparklines (`Historico CPU%`, `Historico RSS`) con los últimos 30 muestreos del proceso seleccionado. Escala fija 0-100 para CPU%, dinámica para RSS. |
+| 2 | **Detección de anomalías** | Zombies nuevos y procesos con CPU% ≥ 90% (con cooldown de 10s por pid para no spamear) aparecen en la misma barra de notificación de abajo que las señales. |
+| 3 | **Modo daemon** | `python3 src/main.py --daemon` (o `docker compose run --rm monitor python src/main.py --daemon`) — corre sin `curses`, loggeando un resumen a `monitor.log` cada 2s. Reusa el mismo manejo de señales (self-pipe) que el modo TUI. |
+| 4 | **Exportación periódica** | Proceso independiente (`exportador.py`) que vuelca el snapshot completo a `exports/export_<timestamp>.json` cada 30s (configurable en `config.json`, clave `exportacion`). |
+| 5 | **Vista de jerarquía** | Tecla `j` — árbol de procesos tipo `pstree`, construido a partir del PPID que ya leíamos para la vista Resumen. |
+| 6 | **Tests unitarios** | `tests/test_procfs.py`, 14 tests con archivos de muestra en `tests/fixtures/` — ver sección de arriba. |
+| 7 | **Mostrar señales recibidas** | Barra de notificación abajo de la pantalla (`>> SIGUSR1 recibido: ...`) que aparece 4 segundos ante cualquier SIGHUP/USR1/USR2. |
+| 8 | **Comparativa cross-proceso** | Tecla `x` marca/desmarca el proceso seleccionado (hasta 3, independiente del pin), tecla `k` muestra la comparación lado a lado (PID, cmd, usuario, estado, CPU%, RSS, threads, nice, policy). |
 
 ## Lo que aprendiste
 
