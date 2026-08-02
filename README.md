@@ -1,2 +1,2 @@
-## Repositorio de Computacion II
-# Alumno: Ezequiel Blajevitch
+#Repositorio de Computacion II
+## Alumno: Ezequiel Blajevitch
