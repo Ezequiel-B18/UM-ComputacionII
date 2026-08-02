@@ -11,5 +11,9 @@
   "filtro_default": {
     "comando": null,
     "usuario": null
+  },
+  "exportacion": {
+    "intervalo_seg": 30.0,
+    "directorio": "exports"
   }
 }
