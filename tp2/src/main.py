@@ -6,14 +6,16 @@ Uso:
 import asyncio
 import logging
 import os
-import time
 from contextlib import asynccontextmanager
 
+import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from modelos import TERMINALES, Estado, Tarea, TareaNueva
+from pool import Pool
+from registro import Registro
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 log = logging.getLogger('tp2')
@@ -24,68 +26,71 @@ TAMANO_COLA = int(os.environ.get('TAMANO_COLA', 1000))
 TIMEOUT_DEFECTO = float(os.environ.get('TIMEOUT_DEFECTO', 60))
 GRACIA_APAGADO = float(os.environ.get('GRACIA_APAGADO', 10))
 
-# Provisorio: registro en memoria sin cola ni workers (se reemplaza en la fase siguiente).
-tareas: dict[str, Tarea] = {}
-
-
 @asynccontextmanager
 async def ciclo(app):
-    log.info('iniciando servidor')
+    cliente = httpx.AsyncClient(timeout=30, follow_redirects=True)
+    app.state.registro = Registro()
+    app.state.pool = Pool(app.state.registro, WORKERS, TAMANO_COLA, PROCESOS, cliente)
+    app.state.pool.iniciar()
+    log.info('servidor listo: %d workers, %d procesos, cola de %d', WORKERS, PROCESOS, TAMANO_COLA)
     yield
-    log.info('apagando servidor')
+    log.info('apagando: gracia de %ss para las tareas en curso', GRACIA_APAGADO)
+    await app.state.pool.apagar(GRACIA_APAGADO)
+    await cliente.aclose()
+    log.info('apagado completo')
 
 
 app = FastAPI(title='Tareas', description='TP2: cola de tareas asíncronas', lifespan=ciclo)
 
 
-def _buscar(id: str) -> Tarea:
-    t = tareas.get(id)
+def _buscar(request: Request, id: str) -> Tarea:
+    t = request.app.state.registro.obtener(id)
     if t is None:
         raise HTTPException(status_code=404, detail='tarea no encontrada')
     return t
 
 
 @app.post('/tareas', status_code=202)
-async def crear(nueva: TareaNueva):
+async def crear(nueva: TareaNueva, request: Request):
     t = Tarea(
         tipo=nueva.tipo,
         parametros=nueva.model_dump(exclude={'tipo', 'timeout'}),
         timeout=nueva.timeout or TIMEOUT_DEFECTO,
     )
-    tareas[t.id] = t
+    try:
+        request.app.state.pool.encolar(t)
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail='el servidor se está apagando')
+    except asyncio.QueueFull:
+        raise HTTPException(status_code=503, detail='cola llena')
     return {'id': t.id, 'estado': t.estado.value}
 
 
 @app.get('/tareas')
-async def listar(estado: Estado | None = None):
-    return [t.a_dict() for t in tareas.values() if estado is None or t.estado is estado]
+async def listar(request: Request, estado: Estado | None = None):
+    return [t.a_dict() for t in request.app.state.registro.listar(estado)]
 
 
 @app.get('/tareas/{id}')
-async def obtener(id: str):
-    return _buscar(id).a_dict()
+async def obtener(id: str, request: Request):
+    return _buscar(request, id).a_dict()
 
 
 @app.delete('/tareas/{id}')
-async def cancelar(id: str):
-    t = _buscar(id)
+async def cancelar(id: str, request: Request):
+    """Si estaba ejecutando, la respuesta puede decir 'ejecutando' un instante:
+    la cancelación se aplica cuando la tarea interna llega a su próximo await."""
+    t = _buscar(request, id)
     if t.estado in TERMINALES:
         raise HTTPException(status_code=409, detail='la tarea ya terminó')
-    t.estado = Estado.CANCELADA
-    t.terminada = time.time()
+    request.app.state.pool.cancelar(t)
     return t.a_dict()
 
 
 @app.get('/estadisticas')
-async def estadisticas():
-    return {
-        'por_estado': {e.value: sum(t.estado is e for t in tareas.values()) for e in Estado},
-        'total': len(tareas),
-        'tiempo_promedio': None,
-        'workers_ocupados': 0,
-        'workers_total': WORKERS,
-        'en_cola': 0,
-    }
+async def estadisticas(request: Request):
+    pool = request.app.state.pool
+    return request.app.state.registro.estadisticas(pool.ocupados, WORKERS, pool.cola.qsize())
 
 
 @app.get('/demo/lento', response_class=PlainTextResponse)
