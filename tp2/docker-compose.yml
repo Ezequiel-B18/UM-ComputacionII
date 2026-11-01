@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./datos:/app/datos
+    environment:
+      WORKERS: 4
+      PROCESOS: 2
+      TAMANO_COLA: 1000
+      TIMEOUT_DEFECTO: 60
+      GRACIA_APAGADO: 10
+    stop_grace_period: 20s
