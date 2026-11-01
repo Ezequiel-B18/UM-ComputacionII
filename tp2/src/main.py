@@ -45,10 +45,19 @@ async def ciclo(app):
     log.info('servidor listo: %d workers, %d procesos, cola de %d', WORKERS, PROCESOS, TAMANO_COLA)
     yield
     log.info('apagando: gracia de %ss para las tareas en curso', GRACIA_APAGADO)
-    await app.state.pool.apagar(GRACIA_APAGADO)
-    await cliente.aclose()
-    ruta = volcar([t.a_dict() for t in app.state.registro.listar(None)])
-    log.info('apagado completo; estado volcado en %s', ruta)
+    try:
+        await app.state.pool.apagar(GRACIA_APAGADO)
+    finally:
+        # Pase lo que pase en apagar, el volcado tiene que intentarse.
+        try:
+            await cliente.aclose()
+        except Exception:
+            log.exception('error al cerrar el cliente HTTP')
+        try:
+            ruta = volcar([t.a_dict() for t in app.state.registro.listar(None)])
+            log.info('apagado completo; estado volcado en %s', ruta)
+        except OSError:
+            log.exception('no se pudo escribir el volcado')
 
 
 app = FastAPI(title='Tareas', description='TP2: cola de tareas asíncronas', lifespan=ciclo)
@@ -94,7 +103,8 @@ async def cancelar(id: str, request: Request):
     t = _buscar(request, id)
     if t.estado in TERMINALES:
         raise HTTPException(status_code=409, detail='la tarea ya terminó')
-    request.app.state.pool.cancelar(t)
+    if not request.app.state.pool.cancelar(t):
+        raise HTTPException(status_code=409, detail='la tarea ya terminó')  # terminó entre la consulta y el cancel
     return t.a_dict()
 
 
@@ -112,4 +122,5 @@ async def lento(segundos: float = Query(default=1.0, ge=0), bytes: int = Query(d
 
 
 if __name__ == '__main__':
-    uvicorn.run(app, host='0.0.0.0', port=8000)
+    # Acota la espera de uvicorn a conexiones abiertas: 5 + GRACIA_APAGADO < stop_grace_period.
+    uvicorn.run(app, host='0.0.0.0', port=8000, timeout_graceful_shutdown=5)

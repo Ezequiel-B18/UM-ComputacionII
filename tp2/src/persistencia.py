@@ -12,7 +12,10 @@ def volcar(tareas: list[dict]) -> Path:
     ahora = datetime.now()
     ruta = DIRECTORIO / f'estado_{ahora:%Y%m%d_%H%M%S}.json'
     datos = {'volcado': ahora.isoformat(), 'tareas': tareas}
-    ruta.write_text(json.dumps(datos, indent=2, ensure_ascii=False), encoding='utf-8')
+    # Escritura atómica: si el proceso muere a mitad, queda un .tmp y nunca un JSON cortado.
+    tmp = ruta.with_name(ruta.name + '.tmp')
+    tmp.write_text(json.dumps(datos, indent=2, ensure_ascii=False), encoding='utf-8')
+    os.replace(tmp, ruta)
     return ruta
 
 

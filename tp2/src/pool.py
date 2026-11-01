@@ -3,6 +3,7 @@ import asyncio
 import logging
 import time
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 
 import httpx
 
@@ -19,6 +20,7 @@ class Pool:
         self.registro = registro
         self.n_workers = workers
         self.cliente = cliente
+        self.procesos = procesos
         self.cola = asyncio.Queue(maxsize=tamano_cola)
         self.ejecutor = ProcessPoolExecutor(max_workers=procesos)
         self.ocupados = 0
@@ -45,6 +47,8 @@ class Pool:
                 log.exception('worker %d: error inesperado con la tarea %s', wid, t.id)
                 if t.estado not in TERMINALES:
                     t.estado = Estado.FALLIDA
+                    t.error = 'error interno del worker'
+                    t.terminada = time.time()
             finally:
                 self.cola.task_done()
 
@@ -52,6 +56,7 @@ class Pool:
         t.estado = Estado.EJECUTANDO
         t.iniciada = time.time()
         self.ocupados += 1
+        ejecutor = self.ejecutor  # para saber si otro worker ya lo recreó
         # La tarea interna es lo que cancela un DELETE; así el worker sobrevive.
         t.task = asyncio.create_task(self._ejecutar(t))
         try:
@@ -66,6 +71,14 @@ class Pool:
                 t.error = 'apagado del servidor'
                 raise  # cancelan al worker mismo: hay que propagarlo
             t.error = 'cancelada por el usuario'
+        except BrokenProcessPool as e:
+            # Un proceso hijo murió (p. ej. OOM): el executor queda inservible para siempre.
+            if self.ejecutor is ejecutor:  # varias tareas pueden ver la misma rotura: recrear una sola vez
+                log.error('el ProcessPoolExecutor se rompió (%s); se recrea', e)
+                ejecutor.shutdown(wait=False, cancel_futures=True)
+                self.ejecutor = ProcessPoolExecutor(max_workers=self.procesos)
+            t.estado = Estado.FALLIDA
+            t.error = f'BrokenProcessPool: {e}'
         except Exception as e:
             t.estado = Estado.FALLIDA
             t.error = f'{type(e).__name__}: {e}'
@@ -73,6 +86,8 @@ class Pool:
             t.terminada = time.time()
             self.ocupados -= 1
             t.task = None
+            log.info('tarea %s (%s) -> %s en %.2fs', t.id, t.tipo, t.estado.value,
+                     t.terminada - (t.iniciada or t.terminada))
 
     async def _ejecutar(self, t: Tarea):
         async with asyncio.timeout(t.timeout):
@@ -96,8 +111,7 @@ class Pool:
             t.terminada = time.time()
             return True
         if t.estado is Estado.EJECUTANDO:
-            t.task.cancel()
-            return True
+            return t.task.cancel()  # False si la tarea interna ya terminó
         return False
 
     async def apagar(self, gracia: float):

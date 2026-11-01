@@ -36,7 +36,7 @@ async def test_esperar_completa(pool):
     await esperar_estado(t, TERMINALES)
     assert t.estado is Estado.COMPLETADA
     assert t.resultado == {'durmio': 0.05}
-    assert t.a_dict()['duracion'] >= 0.05
+    assert t.a_dict()['duracion'] >= 0.04  # reloj de pared contra el monotónico del sleep
 
 
 async def test_timeout_falla(pool):
@@ -108,6 +108,7 @@ async def test_apagar_cancela_las_encoladas(pool):
     assert encolada.estado is Estado.CANCELADA
     assert encolada.error == 'apagado del servidor'
     assert all(t.estado is Estado.CANCELADA for t in largas)
+    assert all(t.error == 'apagado del servidor' for t in largas)  # estaban corriendo
     with pytest.raises(RuntimeError):
         pool.encolar(esperar(0))
 
@@ -119,3 +120,20 @@ async def test_cola_llena():
         with pytest.raises(asyncio.QueueFull):
             p.encolar(esperar(0))
         await p.apagar(0)
+
+
+async def test_descargar_resultado_parcial():
+    """Una URL mala no tumba a las demás: cada una trae su propio resultado."""
+    transporte = httpx.MockTransport(lambda pedido: httpx.Response(200, content=b'x' * 10))
+    async with httpx.AsyncClient(transport=transporte) as cliente:
+        p = Pool(Registro(), workers=1, tamano_cola=10, procesos=1, cliente=cliente)
+        p.iniciar()
+        # 'http://[::1' levanta httpx.InvalidURL, que no es HTTPError ('http://[mal' httpx lo acepta).
+        t = Tarea(tipo='descargar', parametros={'urls': ['http://ok/', 'http://[::1']}, timeout=5)
+        p.encolar(t)
+        await esperar_estado(t, TERMINALES)
+        await p.apagar(1)
+    bueno, malo = t.resultado
+    assert t.estado is Estado.COMPLETADA
+    assert (bueno['estado'], bueno['bytes']) == (200, 10)
+    assert 'error' in malo

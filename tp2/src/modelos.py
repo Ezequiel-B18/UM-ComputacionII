@@ -32,7 +32,7 @@ class Descargar(BaseModel):
 
 class Hashear(BaseModel):
     tipo: Literal['hashear']
-    texto: str
+    texto: str = Field(max_length=10_000)
     iteraciones: int = Field(ge=1, le=50_000_000)
     bloqueante: bool = False
     timeout: float | None = Field(default=None, gt=0)
@@ -56,7 +56,7 @@ class Tarea:
     tipo: str
     parametros: dict
     timeout: float
-    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
     estado: Estado = Estado.PENDIENTE
     creada: float = field(default_factory=time.time)
     iniciada: float | None = None

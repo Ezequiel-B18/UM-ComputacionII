@@ -23,7 +23,7 @@ async def _bajar_una(cliente: httpx.AsyncClient, url: str) -> dict:
     t0 = time.perf_counter()
     try:
         r = await cliente.get(url)
-    except httpx.HTTPError as e:
+    except (httpx.HTTPError, httpx.InvalidURL) as e:  # InvalidURL no hereda de HTTPError
         return {'url': url, 'error': f'{type(e).__name__}: {e}',
                 'segundos': round(time.perf_counter() - t0, 3)}
     return {'url': url, 'estado': r.status_code, 'bytes': len(r.content),

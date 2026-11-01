@@ -25,7 +25,7 @@ en `/estadisticas`.
 | Tarea | Naturaleza | Qué ejercita | Parámetros |
 |-------|-----------|--------------|------------|
 | `descargar` | I/O-bound | Concurrencia asíncrona real | `urls` (1 a 100) |
-| `hashear` | CPU-bound | Que asyncio NO sirve para esto | `texto`, `iteraciones` (1 a 50.000.000), `bloqueante` (por defecto `false`) |
+| `hashear` | CPU-bound | Que asyncio NO sirve para esto | `texto` (hasta 10.000 caracteres), `iteraciones` (1 a 50.000.000), `bloqueante` (por defecto `false`) |
 | `esperar` | I/O simulado | Cancelación y timeouts | `segundos` (0 a 3600) |
 
 Las tres aceptan además `timeout` (segundos, mayor a 0). Si no se manda, se usa
@@ -101,7 +101,7 @@ Respuestas de error:
 | Código | Cuándo |
 |--------|--------|
 | `404` | `GET`/`DELETE` de un `id` que no existe |
-| `409` | `DELETE` de una tarea que ya terminó |
+| `409` | `DELETE` de una tarea que ya terminó (también si terminó justo mientras se procesaba el `DELETE`) |
 | `422` | cuerpo inválido (tipo desconocido, `segundos` negativo, etc.); lo valida pydantic |
 | `503` | cola llena, o el servidor se está apagando |
 
@@ -273,11 +273,15 @@ próximo `await` de esa tarea (clase 20). Según dónde esté:
 - **`esperar`**: el `asyncio.sleep` se interrumpe.
 - **`descargar`**: la tarea está esperando el `asyncio.gather`; cancelarlo
   cancela cada `cliente.get` en vuelo, y httpx cierra o devuelve esas
-  conexiones a su pool. `tareas.py` captura `httpx.HTTPError` pero nunca
+  conexiones a su pool. `tareas.py` captura `httpx.HTTPError` (y `httpx.InvalidURL`) pero nunca
   `CancelledError`, así que la cancelación no se traga.
 - **Tarea pendiente**: todavía no tiene `t.task`. `Pool.cancelar` la marca
   `cancelada` y el worker, cuando la saca de la cola, la descarta sin
   ejecutarla.
+
+Si la tarea interna ya terminó pero el worker todavía no actualizó el estado,
+`t.task.cancel()` devuelve `False`. `Pool.cancelar` devuelve ese valor, y el
+`DELETE` responde `409 la tarea ya terminó` en vez de decir que la canceló.
 
 En `_correr`, `except asyncio.CancelledError` distingue dos casos con
 `asyncio.current_task().cancelling()`: si es `0`, cancelaron la tarea interna
@@ -310,9 +314,21 @@ Hay dos capas:
    `cola.task_done()` va siempre en un `finally` (clase 21: si falta, un
    `join()` espera para siempre).
 
+Si el último recurso actúa, la tarea queda `fallida` con
+`"error interno del worker"`. Además, cada tarea que termina deja una línea en
+el log (`tarea <id> (<tipo>) -> <estado> en <s>s`).
+
 Sin esto, una excepción no capturada mataría la `Task` del worker en
 silencio: el pool se achicaría sin que nadie se entere, y lo único visible
 sería un `Task exception was never retrieved` en el log al final.
+
+Un caso aparte es `BrokenProcessPool`: si un proceso hijo del executor muere
+(por ejemplo, lo mata el sistema por falta de memoria), el
+`ProcessPoolExecutor` queda inservible para siempre y todos los `hashear`
+siguientes fallarían. `_correr` lo captura antes del `except Exception`
+genérico: la tarea queda `fallida` con `"BrokenProcessPool: ..."` (no se
+reintenta) y se crea un executor nuevo, así que los `hashear` siguientes
+vuelven a funcionar.
 
 ### Apagado ordenado
 
@@ -334,14 +350,25 @@ apagado.
 6. `ejecutor.shutdown(wait=False, cancel_futures=True)`.
 
 Después, `ciclo` cierra el cliente (`await cliente.aclose()`) y vuelca todas
-las tareas con `volcar(...)` a `datos/estado_<timestamp>.json`. Al arrancar, si
+las tareas con `volcar(...)` a `datos/estado_<timestamp>.json`. Todo eso va
+en un `finally`: aunque `apagar` falle, el volcado se intenta igual, y un
+error al cerrar el cliente o al escribir el archivo queda en el log con su
+traceback.
+
+El volcado es atómico: `volcar` escribe primero `estado_<timestamp>.json.tmp`
+y después lo renombra con `os.replace`. Si el proceso muere a mitad de la
+escritura queda un `.tmp`, que `ultimo_volcado` ignora, y nunca un JSON
+cortado. Al arrancar, si
 hay un volcado previo, lo informa por log con la cantidad de tareas (si el
 archivo está corrupto, avisa con un warning y sigue).
 
 En Docker: el `CMD` está en forma exec (`["python", "src/main.py"]`), así que
 `python` es el PID 1 y recibe el `SIGTERM` directamente, sin un shell en el
-medio. `stop_grace_period: 20s` es mayor que `GRACIA_APAGADO=10`, para que
-Docker no mande `SIGKILL` antes de que terminemos.
+medio. Antes del `lifespan`, uvicorn espera a que se cierren las conexiones HTTP
+abiertas; `uvicorn.run(..., timeout_graceful_shutdown=5)` acota esa espera.
+Así el peor caso es 5 + `GRACIA_APAGADO` (10) = 15 s, menor que
+`stop_grace_period: 20s`, y Docker no manda `SIGKILL` antes de que
+terminemos.
 
 ### ¿Por qué `httpx` y no `aiohttp`?
 
@@ -361,7 +388,7 @@ sí misma.
 
 Queremos resultados parciales: una URL mala no debe cancelar a las demás.
 `TaskGroup` (`grupos.py` de la clase 21) cancela a las hermanas ante la primera
-excepción. Por eso cada URL captura su propio `httpx.HTTPError` en
+excepción. Por eso cada URL captura su propio `httpx.HTTPError` (y `httpx.InvalidURL`, que no hereda de él) en
 `_bajar_una` y usamos `asyncio.gather`.
 
 ## Mediciones
@@ -511,14 +538,25 @@ Dos preguntas de la consigna, en corto:
 - **`descargar` guarda el cuerpo entero en memoria** (`r.content`) para
   contarlo; un archivo enorme usaría esa cantidad de RAM. Tampoco hay un tope
   de URLs simultáneas más allá del máximo de 100 por tarea del modelo.
+- **Una tarea pendiente cancelada sigue ocupando su lugar en la cola** (y
+  cuenta en `en_cola`) hasta que un worker la saca y la descarta:
+  `asyncio.Queue` no tiene forma de quitar un elemento del medio.
+- **Al apagar, un `hashear` en curso mantiene vivo su proceso hijo**: el
+  volcado ya está escrito, pero el intérprete espera a ese proceso al salir.
+  Si eso supera `stop_grace_period`, Docker manda `SIGKILL`.
+- **`bloqueante=true` lo puede usar cualquier cliente**: existe solo para la
+  medición 2 y no estaría en producción, porque permite congelar la API a
+  propósito.
 - **`datos/` queda con dueño `root`** en Linux (lo crea Docker al montar el
   volumen).
 
 ## Extensiones opcionales implementadas (bonus)
 
-**Tests con `pytest-asyncio`** (`docker compose run --rm api pytest -q`, 9
-tests, menos de un segundo). Prueban el `Pool` directamente, sin HTTP, con un
-`httpx.AsyncClient` real:
+**Tests con `pytest-asyncio`** (`docker compose run --rm api pytest -q`, 13
+tests, menos de un segundo). La mayoría prueban el `Pool` directamente, sin
+HTTP, con un `httpx.AsyncClient` real (o con `httpx.MockTransport` para
+`descargar`); `tests/test_api.py` prueba la API completa con el `TestClient`
+de FastAPI, que también ejecuta el `lifespan`:
 
 | Test | Qué verifica |
 |------|--------------|
@@ -528,9 +566,13 @@ tests, menos de un segundo). Prueban el `Pool` directamente, sin HTTP, con un
 | `test_cancelar_pendiente_nunca_corre` | una tarea cancelada en la cola queda `cancelada` con `iniciada` en `None` |
 | `test_cancelar_terminada_devuelve_false` | `cancelar` sobre una tarea terminada devuelve `False` |
 | `test_hashear_en_el_ejecutor` | el hash calculado en el executor coincide con `hashlib` calculado directamente |
-| `test_apagar_cancela_las_encoladas` | `apagar` cancela las encoladas con `"apagado del servidor"` y después `encolar` lanza `RuntimeError` |
+| `test_apagar_cancela_las_encoladas` | `apagar` cancela con `"apagado del servidor"` tanto las encoladas como las que estaban corriendo, y después `encolar` lanza `RuntimeError` |
 | `test_cola_llena` | con la cola llena, `encolar` lanza `asyncio.QueueFull` |
+| `test_descargar_resultado_parcial` | una URL inválida (`httpx.InvalidURL`) trae su `error` y la otra se descarga igual; la tarea queda `completada` |
 | `test_volcar_y_ultimo_volcado` | el volcado a JSON y `ultimo_volcado` (en un directorio temporal) |
+| `test_id_inexistente_da_404` | `GET` y `DELETE` de un `id` inexistente dan `404` |
+| `test_cuerpo_invalido_da_422` | un cuerpo inválido da `422` |
+| `test_completar_y_cancelar_terminada_da_409` | `POST` de `esperar(0)`, se completa, y el `DELETE` posterior da `409` |
 
 ## Lo que aprendimos
 
