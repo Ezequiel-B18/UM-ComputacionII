@@ -4,6 +4,7 @@ Uso:
     python src/main.py
 """
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -14,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
 from modelos import TERMINALES, Estado, Tarea, TareaNueva
+from persistencia import ultimo_volcado, volcar
 from pool import Pool
 from registro import Registro
 
@@ -26,8 +28,16 @@ TAMANO_COLA = int(os.environ.get('TAMANO_COLA', 1000))
 TIMEOUT_DEFECTO = float(os.environ.get('TIMEOUT_DEFECTO', 60))
 GRACIA_APAGADO = float(os.environ.get('GRACIA_APAGADO', 10))
 
+
 @asynccontextmanager
 async def ciclo(app):
+    previo = ultimo_volcado()
+    if previo:
+        try:
+            n = len(json.loads(previo.read_text(encoding='utf-8'))['tareas'])
+            log.info('volcado previo encontrado: %s (%d tareas)', previo, n)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            log.warning('volcado previo ilegible: %s (%s)', previo, e)
     cliente = httpx.AsyncClient(timeout=30, follow_redirects=True)
     app.state.registro = Registro()
     app.state.pool = Pool(app.state.registro, WORKERS, TAMANO_COLA, PROCESOS, cliente)
@@ -37,7 +47,8 @@ async def ciclo(app):
     log.info('apagando: gracia de %ss para las tareas en curso', GRACIA_APAGADO)
     await app.state.pool.apagar(GRACIA_APAGADO)
     await cliente.aclose()
-    log.info('apagado completo')
+    ruta = volcar([t.a_dict() for t in app.state.registro.listar(None)])
+    log.info('apagado completo; estado volcado en %s', ruta)
 
 
 app = FastAPI(title='Tareas', description='TP2: cola de tareas asíncronas', lifespan=ciclo)
