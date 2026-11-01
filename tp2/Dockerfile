@@ -5,4 +5,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY pytest.ini .
 COPY src src
 COPY tests tests
+COPY mediciones mediciones
 CMD ["python", "src/main.py"]
