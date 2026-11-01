@@ -78,7 +78,17 @@ class Pool:
         async with asyncio.timeout(t.timeout):
             if t.tipo == 'esperar':
                 return await tareas.esperar(t.parametros['segundos'])
-            raise ValueError(f'tipo no soportado todavía: {t.tipo}')
+            if t.tipo == 'descargar':
+                return await tareas.descargar(self.cliente, t.parametros['urls'])
+            if t.tipo == 'hashear':
+                texto, n = t.parametros['texto'], t.parametros['iteraciones']
+                if t.parametros['bloqueante']:
+                    h = tareas.hashear(texto, n)  # bloquea el loop A PROPÓSITO: solo para la medición 2
+                else:
+                    h = await asyncio.get_running_loop().run_in_executor(
+                        self.ejecutor, tareas.hashear, texto, n)
+                return {'hash': h, 'iteraciones': n}
+            raise ValueError(f'tipo desconocido: {t.tipo}')
 
     def cancelar(self, t: Tarea) -> bool:
         if t.estado is Estado.PENDIENTE:
