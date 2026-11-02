@@ -1,0 +1,133 @@
+"""Cola de tareas y pool de workers (patrón de clase 21, cola.py)."""
+import asyncio
+import logging
+import time
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+
+import httpx
+
+import tareas
+from modelos import TERMINALES, Estado, Tarea
+from registro import Registro
+
+log = logging.getLogger('tp2.pool')
+
+
+class Pool:
+    def __init__(self, registro: Registro, workers: int, tamano_cola: int, procesos: int,
+                 cliente: httpx.AsyncClient):
+        self.registro = registro
+        self.n_workers = workers
+        self.cliente = cliente
+        self.procesos = procesos
+        self.cola = asyncio.Queue(maxsize=tamano_cola)
+        self.ejecutor = ProcessPoolExecutor(max_workers=procesos)
+        self.ocupados = 0
+        self.aceptando = True
+        self._workers = []
+
+    def iniciar(self):
+        self._workers = [asyncio.create_task(self._worker(i)) for i in range(self.n_workers)]
+
+    def encolar(self, t: Tarea):
+        if not self.aceptando:
+            raise RuntimeError('apagando')
+        self.cola.put_nowait(t)  # QueueFull se propaga: main responde 503
+        self.registro.agregar(t)
+
+    async def _worker(self, wid: int):
+        while True:
+            t = await self.cola.get()
+            try:
+                if t.estado is Estado.CANCELADA:
+                    continue  # la cancelaron mientras esperaba en la cola
+                await self._correr(t)
+            except Exception:  # último recurso: un worker nunca debe morir
+                log.exception('worker %d: error inesperado con la tarea %s', wid, t.id)
+                if t.estado not in TERMINALES:
+                    t.estado = Estado.FALLIDA
+                    t.error = 'error interno del worker'
+                    t.terminada = time.time()
+            finally:
+                self.cola.task_done()
+
+    async def _correr(self, t: Tarea):
+        t.estado = Estado.EJECUTANDO
+        t.iniciada = time.time()
+        self.ocupados += 1
+        ejecutor = self.ejecutor  # para saber si otro worker ya lo recreó
+        # La tarea interna es lo que cancela un DELETE; así el worker sobrevive.
+        t.task = asyncio.create_task(self._ejecutar(t))
+        try:
+            t.resultado = await t.task
+            t.estado = Estado.COMPLETADA
+        except TimeoutError:
+            t.estado = Estado.FALLIDA
+            t.error = f'timeout: superó {t.timeout}s'
+        except asyncio.CancelledError:
+            t.estado = Estado.CANCELADA
+            if asyncio.current_task().cancelling() > 0:
+                t.error = 'apagado del servidor'
+                raise  # cancelan al worker mismo: hay que propagarlo
+            t.error = 'cancelada por el usuario'
+        except BrokenProcessPool as e:
+            # Un proceso hijo murió (p. ej. OOM): el executor queda inservible para siempre.
+            if self.ejecutor is ejecutor:  # varias tareas pueden ver la misma rotura: recrear una sola vez
+                log.error('el ProcessPoolExecutor se rompió (%s); se recrea', e)
+                ejecutor.shutdown(wait=False, cancel_futures=True)
+                self.ejecutor = ProcessPoolExecutor(max_workers=self.procesos)
+            t.estado = Estado.FALLIDA
+            t.error = f'BrokenProcessPool: {e}'
+        except Exception as e:
+            t.estado = Estado.FALLIDA
+            t.error = f'{type(e).__name__}: {e}'
+        finally:
+            t.terminada = time.time()
+            self.ocupados -= 1
+            t.task = None
+            log.info('tarea %s (%s) -> %s en %.2fs', t.id, t.tipo, t.estado.value,
+                     t.terminada - (t.iniciada or t.terminada))
+
+    async def _ejecutar(self, t: Tarea):
+        async with asyncio.timeout(t.timeout):
+            if t.tipo == 'esperar':
+                return await tareas.esperar(t.parametros['segundos'])
+            if t.tipo == 'descargar':
+                return await tareas.descargar(self.cliente, t.parametros['urls'])
+            if t.tipo == 'hashear':
+                texto, n = t.parametros['texto'], t.parametros['iteraciones']
+                if t.parametros['bloqueante']:
+                    h = tareas.hashear(texto, n)  # bloquea el loop A PROPÓSITO: solo para la medición 2
+                else:
+                    h = await asyncio.get_running_loop().run_in_executor(
+                        self.ejecutor, tareas.hashear, texto, n)
+                return {'hash': h, 'iteraciones': n}
+            raise ValueError(f'tipo desconocido: {t.tipo}')
+
+    def cancelar(self, t: Tarea) -> bool:
+        if t.estado is Estado.PENDIENTE:
+            t.estado = Estado.CANCELADA  # el worker la descarta al sacarla de la cola
+            t.terminada = time.time()
+            return True
+        if t.estado is Estado.EJECUTANDO:
+            return t.task.cancel()  # False si la tarea interna ya terminó
+        return False
+
+    async def apagar(self, gracia: float):
+        self.aceptando = False
+        for t in self.registro.listar(Estado.PENDIENTE):
+            t.estado = Estado.CANCELADA
+            t.terminada = time.time()
+            t.error = 'apagado del servidor'
+        en_curso = [t.task for t in self.registro.listar(Estado.EJECUTANDO) if t.task]
+        if en_curso:
+            log.info('esperando hasta %ss a %d tareas en curso', gracia, len(en_curso))
+            await asyncio.wait(en_curso, timeout=gracia)
+        for t in self.registro.listar(Estado.EJECUTANDO):
+            if t.task:
+                t.task.cancel()
+        for w in self._workers:
+            w.cancel()
+        await asyncio.gather(*self._workers, return_exceptions=True)
+        self.ejecutor.shutdown(wait=False, cancel_futures=True)
