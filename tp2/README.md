@@ -574,21 +574,24 @@ de FastAPI, que también ejecuta el `lifespan`:
 | `test_cuerpo_invalido_da_422` | un cuerpo inválido da `422` |
 | `test_completar_y_cancelar_terminada_da_409` | `POST` de `esperar(0)`, se completa, y el `DELETE` posterior da `409` |
 
-## Lo que aprendimos
+## Lo que aprendí
 
-"No bloquees el event loop" era una frase que sabíamos repetir, pero medirlo
-la volvió concreta: un `GET /tareas` que tarda casi 5 segundos en responder
-porque una tarea está calculando un hash, contra 2 ms cuando ese mismo
-cálculo se va a otro proceso. El cálculo tarda lo mismo en los dos casos; lo
-que cambia es si el resto del servidor puede seguir viviendo mientras tanto.
+Antes de este TP pensaba que asyncio corría cosas en paralelo y que por eso
+hacía todo más rápido. Lo que me lo cambió fue ver el `curl` colgarse: mandé
+un `hashear` con `bloqueante: true` y un simple `GET /tareas` tardó casi 5
+segundos en responder. Ahí entendí que asyncio usa un solo thread y que solo
+cambia de tarea en los `await`. Si una tarea se pone a calcular, no hay ningún
+`await`, y todo el servidor queda esperando.
 
-También entendimos que la cancelación en asyncio es cooperativa: `cancel()`
-solo pide, y el `CancelledError` aparece en el próximo `await`. Eso explica a
-la vez por qué cancelar una descarga es limpio (está casi siempre en un
-`await`) y por qué un hash que corre en otro proceso no se puede cancelar: ahí
-no hay ningún `await` donde inyectar nada.
+Con el mismo cálculo mandado a un `ProcessPoolExecutor`, la API respondía en
+2 ms. El hash tardaba lo mismo, pero ya no frenaba al resto. O sea que asyncio
+no hace las cosas más rápidas: sirve para no quedarse quieto mientras se
+espera algo, como una descarga. Para calcular hacen falta procesos.
 
-Por último, nos sorprendió ver moverse el techo. Con pocos workers el límite
-era el pool, y los números coincidían con la cuenta `ceil(N/W)` casi al
-milisegundo; al subir a 200 workers el límite pasó a ser el propio event loop,
-que con un solo thread tiene que atender todos los pedidos HTTP.
+Lo que más me costó entender fue por qué no se puede cancelar un hash que ya
+está corriendo, si una descarga sí se cancela sin problema. La razón es que en
+asyncio cancelar no corta la tarea de golpe: le avisa, y la tarea se entera en
+su próximo `await`. Una descarga está casi siempre esperando en un `await`,
+pero el hash corre en otro proceso y no tiene ninguno, así que no hay dónde
+avisarle. Lo único que puedo hacer es marcarla como cancelada y descartar el
+resultado.
